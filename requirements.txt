@@ -1,3 +1,2 @@
-markdown==3.4.3
-python-docx==0.8.11
-beautifulsoup4==4.12.2
+python-docx>=1.0.0
+markdown-it-py>=3.0.0
