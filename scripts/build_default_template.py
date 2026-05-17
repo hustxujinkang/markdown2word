@@ -140,9 +140,14 @@ def build_template(out_path: str) -> None:
     _set_first_line_chars(normal, 2)
     _set_spacing_before_after(normal, 0, 0)
 
-    # ------------ Headings 1..4 ----------
-    heading_sizes = {1: 16, 2: 15, 3: 14, 4: 12}           # 三号 / 小三 / 四号 / 小四
-    heading_spacing = {1: (18, 12), 2: (16, 10), 3: (14, 8), 4: (12, 6)}
+    # ------------ Headings 1..6 ----------
+    # All six levels get the same heading-font treatment. Earlier
+    # versions only configured 1..4 and left 5/6 inheriting Word's
+    # default, which left the eastAsia slot empty — Chinese text in
+    # H5/H6 would fall back to Calibri. `md2word inspect` will flag
+    # exactly this kind of gap on user templates.
+    heading_sizes = {1: 16, 2: 15, 3: 14, 4: 12, 5: 11, 6: 10}      # 三号 / 小三 / 四号 / 小四 / 五号 / 小五
+    heading_spacing = {1: (18, 12), 2: (16, 10), 3: (14, 8), 4: (12, 6), 5: (10, 4), 6: (8, 4)}
     for level, size in heading_sizes.items():
         style = doc.styles[f"Heading {level}"]
         style.font.size = Pt(size)

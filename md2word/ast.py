@@ -106,3 +106,4 @@ Block = Union[
 @dataclass
 class Document:
     blocks: List[Block] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)

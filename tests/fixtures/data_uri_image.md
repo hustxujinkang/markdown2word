@@ -1,0 +1,5 @@
+这里是一张内联图片:
+
+![inline diagram](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=)
+
+图后还有正文。

@@ -30,15 +30,57 @@ DEFAULTS = {
 }
 
 
-def apply_font(run, spec: FontSpec) -> None:
+def apply_font(run, spec: FontSpec, fill_missing_only: bool = False) -> None:
+    """Set the four font slots on `run`.
+
+    fill_missing_only=False (default): full override — all four slots get
+    written from `spec`. This is what we want when rendering with the
+    builtin template, where we own the styling end-to-end.
+
+    fill_missing_only=True: respect whatever the run/style already has;
+    only write a slot if it is currently unset. This is what we want when
+    the user passed their own template: we don't want to clobber their
+    carefully chosen fonts, but we do want to backfill the eastAsia slot
+    if they forgot it (the classic CJK-renders-in-Calibri bug).
+
+    Size is only written when the run has no size set (under
+    fill_missing_only) or unconditionally (under full override) and `spec`
+    actually carries one.
+    """
     rpr = run._element.get_or_add_rPr()
     rfonts = rpr.find(qn("w:rFonts"))
     if rfonts is None:
         rfonts = OxmlElement("w:rFonts")
         rpr.append(rfonts)
-    rfonts.set(qn("w:ascii"),    spec.latin)
-    rfonts.set(qn("w:hAnsi"),    spec.latin)
-    rfonts.set(qn("w:eastAsia"), spec.cjk)
-    rfonts.set(qn("w:cs"),       spec.latin)
+
+    def _set(slot: str, value: str) -> None:
+        if value is None:
+            return
+        if fill_missing_only and rfonts.get(qn(f"w:{slot}")):
+            return
+        rfonts.set(qn(f"w:{slot}"), value)
+
+    _set("ascii",    spec.latin)
+    _set("hAnsi",    spec.latin)
+    _set("eastAsia", spec.cjk)
+    _set("cs",       spec.latin)
+
     if spec.size_pt is not None:
-        run.font.size = Pt(spec.size_pt)
+        if not (fill_missing_only and run.font.size is not None):
+            run.font.size = Pt(spec.size_pt)
+
+
+def style_has_eastasia_font(style) -> bool:
+    """Return True if `style` (a docx Style) declares a w:eastAsia font.
+
+    Used to decide whether a user template's heading/normal style already
+    handles CJK on its own, or whether we need to backfill at the run level.
+    """
+    elem = style.element if hasattr(style, "element") else style._element
+    rpr = elem.find(qn("w:rPr"))
+    if rpr is None:
+        return False
+    rfonts = rpr.find(qn("w:rFonts"))
+    if rfonts is None:
+        return False
+    return bool(rfonts.get(qn("w:eastAsia")))

@@ -4,9 +4,16 @@ We rely on markdown-it-py for tokenization (it handles all the CommonMark
 edge cases we don't want to debug), then fold its flat token stream into a
 proper tree. Token folding is done with a small index cursor — no recursion
 into the tokenizer itself.
+
+A leading YAML frontmatter block (delimited by `---` on its own line at
+both ends) is extracted before tokenization and exposed via
+Document.metadata. PyYAML is used when available; if it isn't installed,
+we fall back to a tolerant `key: value` line parser (no nesting, no
+multi-line strings). This keeps the dependency optional.
 """
 from __future__ import annotations
 
+import re
 from typing import List, Tuple
 
 from markdown_it import MarkdownIt
@@ -18,11 +25,64 @@ from .ast import (
 )
 
 
+_FRONTMATTER_RE = re.compile(
+    r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n",
+    re.DOTALL,
+)
+
+
+def _parse_frontmatter(md_text: str) -> Tuple[dict, str]:
+    """Return (metadata_dict, remaining_markdown).
+
+    If no frontmatter block is present, returns ({}, md_text) unchanged.
+    """
+    m = _FRONTMATTER_RE.match(md_text)
+    if not m:
+        return {}, md_text
+    raw = m.group(1)
+    rest = md_text[m.end():]
+    try:
+        import yaml  # type: ignore
+        data = yaml.safe_load(raw) or {}
+        if not isinstance(data, dict):
+            # YAML that parses to a scalar/list isn't useful as metadata;
+            # treat it as "no frontmatter" rather than crash.
+            return {}, md_text
+        return data, rest
+    except ImportError:
+        return _fallback_yaml(raw), rest
+
+
+def _fallback_yaml(raw: str) -> dict:
+    """Tolerant key: value parser for when PyYAML is absent.
+
+    Handles only flat `key: value` lines. Quoted strings have their outer
+    quotes stripped. Lists / nested maps are not supported here — install
+    PyYAML if you need them.
+    """
+    out: dict = {}
+    for line in raw.splitlines():
+        line = line.rstrip()
+        if not line or line.lstrip().startswith("#"):
+            continue
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        k = k.strip()
+        v = v.strip()
+        if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+            v = v[1:-1]
+        if k:
+            out[k] = v
+    return out
+
+
 def parse(md_text: str) -> Document:
+    metadata, body = _parse_frontmatter(md_text)
     md = MarkdownIt("commonmark", {"html": False}).enable("table").enable("strikethrough")
-    tokens = md.parse(md_text)
+    tokens = md.parse(body)
     blocks, _ = _read_blocks(tokens, 0, stop_at=None)
-    return Document(blocks=blocks)
+    return Document(blocks=blocks, metadata=metadata)
 
 
 # --- block-level folding --------------------------------------------------

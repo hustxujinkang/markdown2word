@@ -261,5 +261,258 @@ class TestEndToEndSample(unittest.TestCase):
         os.unlink(out_path)
 
 
+# ----------------- new tests: bug fixes & v0.2 features -----------------
+
+
+class TestFrontmatter(unittest.TestCase):
+    """YAML frontmatter is parsed out and routed to docx core properties."""
+
+    def test_frontmatter_populates_core_properties(self):
+        doc, out_path = render_fixture("frontmatter")
+        cp = doc.core_properties
+        self.assertEqual(cp.title, "二〇二六年第一季度工作总结")
+        self.assertEqual(cp.author, "张三")
+        self.assertEqual(cp.keywords, "季度总结, 工作回顾")
+        self.assertEqual(cp.comments, "季度工作回顾与下阶段计划")
+        os.unlink(out_path)
+
+    def test_frontmatter_not_in_body(self):
+        """Frontmatter shouldn't leak as text into the document body."""
+        doc, out_path = render_fixture("frontmatter")
+        full_text = "\n".join(p.text for p in doc.paragraphs)
+        self.assertNotIn("title:", full_text)
+        self.assertNotIn("author:", full_text)
+        # The actual H1 from after the frontmatter should still be there.
+        self.assertIn("第一季度总结", full_text)
+        os.unlink(out_path)
+
+    def test_no_frontmatter_is_harmless(self):
+        """Documents without frontmatter still render normally."""
+        from md2word.parser import parse as parse_md
+        ast = parse_md("# 普通标题\n\n正文段落。\n")
+        self.assertEqual(ast.metadata, {})
+        self.assertEqual(len(ast.blocks), 2)
+
+    def test_frontmatter_parser_directly(self):
+        from md2word.parser import _parse_frontmatter
+        md = "---\ntitle: 测试\nauthor: 李四\n---\n\n# 标题\n\n正文\n"
+        meta, rest = _parse_frontmatter(md)
+        self.assertEqual(meta["title"], "测试")
+        self.assertEqual(meta["author"], "李四")
+        self.assertTrue(rest.startswith("\n# 标题"))
+
+
+class TestMultiParagraphQuote(unittest.TestCase):
+    """Regression: every paragraph inside a blockquote must get Quote style,
+    not just the last one."""
+
+    def test_all_three_paragraphs_styled_as_quote(self):
+        doc, out_path = render_fixture("multi_quote")
+        quote_paras = [p for p in doc.paragraphs if style_of(p) == "Quote" and p.text]
+        self.assertEqual(len(quote_paras), 3,
+                         f"expected 3 Quote-styled paragraphs, got {len(quote_paras)}")
+        texts = [p.text for p in quote_paras]
+        self.assertIn("这是第一段引用。", texts)
+        self.assertIn("这是第三段。", texts)
+        os.unlink(out_path)
+
+
+class TestDataUriImage(unittest.TestCase):
+    """Inline base64 data URIs should be decoded and embedded as images,
+    not dropped to alt text."""
+
+    def test_data_uri_embedded(self):
+        doc, out_path = render_fixture("data_uri_image")
+        # The presence of an embedded image part means decode + embed worked
+        rels = doc.part.rels
+        image_rels = [r for r in rels.values() if "image" in r.reltype]
+        self.assertEqual(len(image_rels), 1,
+                         "expected one embedded image from the data URI")
+        os.unlink(out_path)
+
+    def test_decode_data_uri_unit(self):
+        """Direct test of the decoder, independent of the renderer."""
+        from md2word.renderer import _decode_data_uri
+        # 1x1 transparent PNG
+        png = ("data:image/png;base64,"
+               "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
+        tmp = _decode_data_uri(png)
+        self.assertIsNotNone(tmp)
+        self.assertTrue(os.path.exists(tmp))
+        # First bytes should be the PNG magic
+        with open(tmp, "rb") as f:
+            head = f.read(4)
+        self.assertEqual(head, b"\x89PNG")
+        os.unlink(tmp)
+
+    def test_decode_rejects_svg(self):
+        """SVG data URIs are skipped (python-docx can't embed them)."""
+        from md2word.renderer import _decode_data_uri
+        svg = "data:image/svg+xml;base64,PHN2Zy8+"
+        self.assertIsNone(_decode_data_uri(svg))
+
+
+class TestDeepListLevels(unittest.TestCase):
+    """Nested lists past level 0 should carry an explicit w:ilvl so that
+    multi-level numbering in a user template can fire."""
+
+    def test_ilvl_present_at_each_depth(self):
+        doc, out_path = render_fixture("deep_list")
+        levels_seen = {}
+        for p in doc.paragraphs:
+            if not p.text:
+                continue
+            pPr = p._p.find(qn("w:pPr"))
+            if pPr is None:
+                continue
+            numPr = pPr.find(qn("w:numPr"))
+            if numPr is None:
+                continue
+            ilvl = numPr.find(qn("w:ilvl"))
+            if ilvl is None:
+                continue
+            levels_seen[p.text] = int(ilvl.get(qn("w:val")) or "0")
+        # We expect levels 1, 2, 3 to be explicitly stamped (level 0 inherits
+        # from the style, no explicit ilvl needed).
+        self.assertEqual(levels_seen.get("第二层"), 1)
+        self.assertEqual(levels_seen.get("第三层"), 2)
+        self.assertEqual(levels_seen.get("第四层"), 3)
+        os.unlink(out_path)
+
+
+class TestRespectTemplateFonts(unittest.TestCase):
+    """With a user template, the renderer should not overwrite fonts that
+    the template already defines."""
+
+    def _make_template_with_custom_fonts(self, tmp_path):
+        """Build a minimal docx where Normal uses Microsoft YaHei for both
+        Latin and CJK — the kind of customization a user template would
+        carry that the old renderer would silently clobber."""
+        from docx import Document as DocxDocument
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn as _qn
+        d = DocxDocument()
+        normal = d.styles["Normal"]
+        rpr = normal.element.get_or_add_rPr()
+        rfonts = rpr.find(_qn("w:rFonts"))
+        if rfonts is None:
+            rfonts = OxmlElement("w:rFonts")
+            rpr.append(rfonts)
+        rfonts.set(_qn("w:ascii"), "Microsoft YaHei")
+        rfonts.set(_qn("w:hAnsi"), "Microsoft YaHei")
+        rfonts.set(_qn("w:eastAsia"), "Microsoft YaHei")
+        rfonts.set(_qn("w:cs"), "Microsoft YaHei")
+        d.save(tmp_path)
+
+    def test_user_template_fonts_preserved(self):
+        from md2word.parser import parse
+        from md2word.renderer import Renderer
+        fd, tpl = tempfile.mkstemp(suffix=".docx"); os.close(fd)
+        self._make_template_with_custom_fonts(tpl)
+
+        fd, out = tempfile.mkstemp(suffix=".docx"); os.close(fd)
+        ast = parse("这是一段中文正文。\n")
+        Renderer(template=tpl).render(ast, out)
+
+        rendered = Document(out)
+        p = next(p for p in rendered.paragraphs if p.text)
+        # In respect-mode, since the style already declares eastAsia,
+        # we should NOT have written a per-run rFonts that overrides it
+        # to 宋体. Either there's no run-level rFonts, or it preserves
+        # the style's choice.
+        for r in p.runs:
+            fonts = run_fonts(r)
+            if fonts.get("eastAsia"):
+                self.assertEqual(fonts["eastAsia"], "Microsoft YaHei",
+                                 "user template's CJK font was overwritten")
+        os.unlink(tpl); os.unlink(out)
+
+    def test_builtin_template_still_overrides(self):
+        """Sanity: with the builtin template (no user template), we still
+        apply our default fonts — that's what the existing CJKFontSlots
+        test relies on. This is a guard against accidentally flipping the
+        default."""
+        doc, out_path = render_fixture("cjk_mixed")
+        p = next(p for p in doc.paragraphs if p.text)
+        for r in p.runs:
+            fonts = run_fonts(r)
+            self.assertEqual(fonts.get("eastAsia"), "宋体")
+        os.unlink(out_path)
+
+
+class TestInspect(unittest.TestCase):
+    """The inspect command reads template metadata without crashing and
+    surfaces the kind of warnings users actually need."""
+
+    def test_inspect_builtin_template(self):
+        from md2word.inspect import inspect_template, format_report_text
+        builtin = os.path.join(os.path.dirname(__file__), "..", "md2word",
+                               "templates", "default_zh.docx")
+        report = inspect_template(builtin)
+        self.assertGreater(report.style_count, 10)
+        # All the styles the builtin template was built to provide must match
+        roles_matched = {s.role: s.matched for s in report.styles}
+        self.assertEqual(roles_matched["一级标题"], "Heading 1")
+        self.assertEqual(roles_matched["正文"], "Normal")
+        self.assertEqual(roles_matched["代码块"], "Code Block")
+        # Page setup parsed
+        self.assertIsNotNone(report.page)
+        self.assertGreater(report.page.width_mm, 100)
+        # Text rendering shouldn't crash
+        text = format_report_text(report)
+        self.assertIn("模板文件", text)
+        self.assertIn("样式匹配", text)
+
+    def test_inspect_warns_on_missing_styles(self):
+        """A blank docx (python-docx's built-in default) is missing several
+        of our target styles — inspect must say so."""
+        from docx import Document as DocxDocument
+        from md2word.inspect import inspect_template
+        fd, tpl = tempfile.mkstemp(suffix=".docx"); os.close(fd)
+        DocxDocument().save(tpl)  # Truly default, no Code Block, no Caption
+        report = inspect_template(tpl)
+        missing_roles = {s.role for s in report.styles if s.matched is None}
+        # Code Block and Caption are not in python-docx's default styles
+        self.assertIn("代码块", missing_roles)
+        self.assertTrue(any("代码块" in w for w in report.warnings))
+        os.unlink(tpl)
+
+    def test_inspect_json_output(self):
+        from md2word.inspect import inspect_template, format_report_json
+        builtin = os.path.join(os.path.dirname(__file__), "..", "md2word",
+                               "templates", "default_zh.docx")
+        report = inspect_template(builtin)
+        import json
+        parsed = json.loads(format_report_json(report))
+        self.assertIn("styles", parsed)
+        self.assertIn("page", parsed)
+
+
+class TestCliBackwardCompat(unittest.TestCase):
+    """The old `md2word input.md -o out.docx` form must still work even
+    though we now have subcommands."""
+
+    def test_implicit_convert_subcommand(self):
+        import io, contextlib
+        from md2word.cli import main as cli_main
+        fd, out = tempfile.mkstemp(suffix=".docx"); os.close(fd)
+        md = os.path.join(FIXTURES, "headings.md")
+        # No "convert" subcommand on the argv — backwards compat path
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = cli_main([md, "-o", out])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(out))
+        os.unlink(out)
+
+    def test_explicit_inspect_subcommand(self):
+        import io, contextlib
+        from md2word.cli import main as cli_main
+        builtin = os.path.join(os.path.dirname(__file__), "..", "md2word",
+                               "templates", "default_zh.docx")
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = cli_main(["inspect", builtin])
+        self.assertEqual(rc, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
