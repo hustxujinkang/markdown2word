@@ -489,8 +489,6 @@ class TestInspect(unittest.TestCase):
 
 
 class TestCliBackwardCompat(unittest.TestCase):
-    """The old `md2word input.md -o out.docx` form must still work even
-    though we now have subcommands."""
 
     def test_implicit_convert_subcommand(self):
         import io, contextlib
@@ -512,6 +510,178 @@ class TestCliBackwardCompat(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             rc = cli_main(["inspect", builtin])
         self.assertEqual(rc, 0)
+
+
+# --------------- new tests: builtin templates batch (v0.3) ---------------
+
+
+class TestBuiltinTemplatesRegistry(unittest.TestCase):
+    """The registry should list all bundled .docx files; each one must
+    actually exist on disk."""
+
+    def test_all_registered_templates_exist(self):
+        from md2word.builtin_templates import BUILTINS
+        self.assertGreater(len(BUILTINS), 0)
+        for t in BUILTINS:
+            self.assertTrue(t.exists,
+                            f"registered template {t.name} missing at {t.path}")
+
+    def test_lookup_by_name_with_and_without_at(self):
+        from md2word.builtin_templates import by_name
+        a = by_name("gov_notice")
+        b = by_name("@gov_notice")
+        c = by_name("GOV_NOTICE")  # case-insensitive
+        self.assertIs(a, b)
+        self.assertIs(a, c)
+        self.assertIsNotNone(a)
+
+    def test_unknown_name_returns_none(self):
+        from md2word.builtin_templates import by_name
+        self.assertIsNone(by_name("nonexistent"))
+
+
+class TestBuiltinTemplatesRender(unittest.TestCase):
+    """Each builtin template must render a representative sample without
+    crashing and produce a sane-looking docx. Also inspect should report
+    zero warnings — these templates are our reference of "what a correct
+    template looks like"; regressions here are bugs in the build scripts."""
+
+    def _render(self, template_path):
+        from md2word.parser import parse
+        from md2word.renderer import Renderer
+        sample = os.path.join(FIXTURES, "sample.md")
+        with open(sample, encoding="utf-8") as f:
+            ast = parse(f.read())
+        fd, out = tempfile.mkstemp(suffix=".docx"); os.close(fd)
+        Renderer(template=template_path).render(ast, out)
+        return Document(out), out
+
+    def test_each_template_renders_sample(self):
+        from md2word.builtin_templates import BUILTINS
+        for t in BUILTINS:
+            with self.subTest(template=t.name):
+                doc, out = self._render(t.path)
+                # Sanity: it produced paragraphs and at least one table
+                # (sample.md has a table).
+                self.assertGreater(len(doc.paragraphs), 5)
+                self.assertGreater(len(doc.tables), 0)
+                os.unlink(out)
+
+    def test_each_template_has_zero_inspect_warnings(self):
+        """Regression guard for build scripts: if a future edit drops a
+        CJK font slot or renames a style, inspect's warnings will fire
+        and this test will catch it before users do."""
+        from md2word.builtin_templates import BUILTINS
+        from md2word.inspect import inspect_template
+        for t in BUILTINS:
+            with self.subTest(template=t.name):
+                report = inspect_template(t.path)
+                self.assertEqual(
+                    report.warnings, [],
+                    f"template {t.name} has inspect warnings: {report.warnings}",
+                )
+
+
+class TestCliAtNameShorthand(unittest.TestCase):
+    """The `-t @name` shorthand resolves to a packaged template path."""
+
+    def test_at_name_resolves_to_builtin(self):
+        import io, contextlib
+        from md2word.cli import main as cli_main
+        fd, out = tempfile.mkstemp(suffix=".docx"); os.close(fd)
+        md = os.path.join(FIXTURES, "headings.md")
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = cli_main(["convert", md, "-t", "@gov_notice", "-o", out])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(out))
+        os.unlink(out)
+
+    def test_unknown_at_name_errors(self):
+        import io, contextlib
+        from md2word.cli import main as cli_main
+        fd, out = tempfile.mkstemp(suffix=".docx"); os.close(fd)
+        md = os.path.join(FIXTURES, "headings.md")
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(stderr):
+            rc = cli_main(["convert", md, "-t", "@nonexistent", "-o", out])
+        self.assertEqual(rc, 2)
+        self.assertIn("找不到内置模板", stderr.getvalue())
+        if os.path.exists(out):
+            os.unlink(out)
+
+    def test_inspect_accepts_at_name(self):
+        import io, contextlib
+        from md2word.cli import main as cli_main
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = cli_main(["inspect", "@report"])
+        self.assertEqual(rc, 0)
+
+
+class TestTemplatesSubcommand(unittest.TestCase):
+    """The `md2word templates` group: list / show / eject."""
+
+    def test_list_default_action(self):
+        import io, contextlib
+        from md2word.cli import main as cli_main
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli_main(["templates"])
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("@gov_notice", text)
+        self.assertIn("@report", text)
+        self.assertIn("@tech_doc", text)
+        self.assertIn("@paper", text)
+
+    def test_list_json(self):
+        import io, contextlib, json
+        from md2word.cli import main as cli_main
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli_main(["templates", "list", "--json"])
+        self.assertEqual(rc, 0)
+        data = json.loads(out.getvalue())
+        names = {item["name"] for item in data}
+        self.assertIn("gov_notice", names)
+        self.assertIn("paper", names)
+
+    def test_show_outputs_inspect_report(self):
+        import io, contextlib
+        from md2word.cli import main as cli_main
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli_main(["templates", "show", "tech_doc"])
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("@tech_doc", text)
+        # The inspect report follows
+        self.assertIn("样式匹配", text)
+
+    def test_eject_copies_file(self):
+        import io, contextlib
+        from md2word.cli import main as cli_main
+        fd, dest = tempfile.mkstemp(suffix=".docx"); os.close(fd)
+        os.unlink(dest)  # eject must not overwrite — start with no file
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = cli_main(["templates", "eject", "report", "-o", dest])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(dest))
+        # It's a real .docx (python-docx can open it)
+        Document(dest)
+        os.unlink(dest)
+
+    def test_eject_refuses_to_overwrite(self):
+        import io, contextlib
+        from md2word.cli import main as cli_main
+        fd, dest = tempfile.mkstemp(suffix=".docx"); os.close(fd)
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(stderr):
+            rc = cli_main(["templates", "eject", "report", "-o", dest])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("已存在", stderr.getvalue())
+        os.unlink(dest)
 
 
 if __name__ == "__main__":

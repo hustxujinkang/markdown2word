@@ -33,15 +33,52 @@ CJK_CODE      = "宋体"
 
 
 def _set_rfonts(rpr, latin: str, cjk: str) -> None:
-    """Set all four font slots — the CJK fix that matters."""
+    """Set all four font slots — the CJK fix that matters.
+
+    Also strip any `*Theme` attributes — they take priority over direct
+    font names in Word's resolution order. python-docx's blank template
+    pre-fills these with references that resolve to 日文 fonts (MS
+    Gothic / MS Mincho); leaving them in place causes Chinese to render
+    as MS Gothic even after we set w:eastAsia explicitly.
+    """
     rfonts = rpr.find(qn("w:rFonts"))
     if rfonts is None:
         rfonts = OxmlElement("w:rFonts")
         rpr.insert(0, rfonts)
+    for theme_attr in ("asciiTheme", "hAnsiTheme", "eastAsiaTheme", "cstheme"):
+        attr_name = qn(f"w:{theme_attr}")
+        if rfonts.get(attr_name) is not None:
+            del rfonts.attrib[attr_name]
     rfonts.set(qn("w:ascii"),    latin)
     rfonts.set(qn("w:hAnsi"),    latin)
     rfonts.set(qn("w:eastAsia"), cjk)
     rfonts.set(qn("w:cs"),       latin)
+
+
+def _set_default_eastasia_zh_cn(doc) -> None:
+    """Force docDefaults' eastAsia language to zh-CN so Word doesn't
+    fall back to 日文 CJK fonts. Same fix as in _template_helpers, kept
+    inline here because this script doesn't import the shared module."""
+    styles_part = doc.styles.element
+    doc_defaults = styles_part.find(qn("w:docDefaults"))
+    if doc_defaults is None:
+        doc_defaults = OxmlElement("w:docDefaults")
+        styles_part.insert(0, doc_defaults)
+    rpr_default = doc_defaults.find(qn("w:rPrDefault"))
+    if rpr_default is None:
+        rpr_default = OxmlElement("w:rPrDefault")
+        doc_defaults.append(rpr_default)
+    rpr = rpr_default.find(qn("w:rPr"))
+    if rpr is None:
+        rpr = OxmlElement("w:rPr")
+        rpr_default.append(rpr)
+    lang = rpr.find(qn("w:lang"))
+    if lang is None:
+        lang = OxmlElement("w:lang")
+        rpr.append(lang)
+    lang.set(qn("w:val"),      "zh-CN")
+    lang.set(qn("w:eastAsia"), "zh-CN")
+    lang.set(qn("w:bidi"),     "ar-SA")
 
 
 def _style_rpr(style):
@@ -122,6 +159,7 @@ def _set_left_border(style, color_hex: str, size: int = 24) -> None:
 
 def build_template(out_path: str) -> None:
     doc = Document()
+    _set_default_eastasia_zh_cn(doc)
 
     # ------------ page setup (A4 with Chinese-convention margins) ----------
     section = doc.sections[0]
